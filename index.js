@@ -5,8 +5,8 @@ const moment = require('moment');
 /* ======================
     🔑 기본 설정
 ====================== */
-const TELEGRAM_TOKEN = '8483722906:AAESTfCgkGUjSbwxCTn5LuNEJDrxWIiOPAs';
-const DART_API_KEY = 'f248b42062220d73d89ab0fa0f152f231b082bf4';
+const TELEGRAM_TOKEN = '';
+const DART_API_KEY = '';
 const DART_LIST_URL = 'https://opendart.fss.or.kr/api/list.json';
 const DART_DOC_URL = 'https://opendart.fss.or.kr/api/document.xml'; // 본문 추출용
 
