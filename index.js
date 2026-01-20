@@ -6,7 +6,7 @@ const AdmZip = require('adm-zip');
 /* ======================
     🔑 기본 설정
 ====================== */
-const TELEGRAM_TOKEN = '';
+const TELEGRAM_TOKEN = '8';
 const DART_API_KEY = '';
 const DART_LIST_URL = 'https://opendart.fss.or.kr/api/list.json';
 const DART_DOC_URL = 'https://opendart.fss.or.kr/api/document.xml'; // 본문 추출용
@@ -31,7 +31,7 @@ const GOOD_REGEX = new RegExp([
     '탈모\\s*(신약|치료제|재생)', '무상\\s*증자'
 ].join('|'), 'i');
 
-const BAD_REGEX = /(계획|예정|검토|가능성|기대|준비중|추진)/i;
+const BAD_REGEX = /(주식처분|신탁계약|기재정정|계획|예정|검토|가능성|기대|준비중|추진)/i;
 
 const SPIKE_REGEX = new RegExp([
     '기술\\s*이전', '라이선스', 'FDA\\s*(승인|허가)', '임상\\s*3상', 'CSR',
@@ -82,18 +82,16 @@ async function getDocSummary(rcpNo) {
 /* ======================
     🚀 DART 메인 스캔 로직
 ===================== */
+/* ======================
+    🚀 DART 메인 스캔 로직 (20% 필터 + 50% 강조 로직)
+===================== */
 async function scanDart() {
     if (!targetChatId) return;
     const logTime = moment().format('HH:mm:ss');
 
-    if (!isMarketOpen()) {
-        console.log(`[${logTime}][시스템] 장 운영 시간 외 대기 중...`);
-        return;
-    }
-
     try {
         const res = await axios.get(DART_LIST_URL, {
-            params: { crtfc_key: DART_API_KEY, page_count: 20 },
+            params: { crtfc_key: DART_API_KEY, page_count: 15 },
             timeout: 5000
         });
 
@@ -105,47 +103,69 @@ async function scanDart() {
             const title = item.report_nm;
             const corp = item.corp_name;
             const rcpNo = item.rcept_no;
-            const hot = extractHotKeyword(title);
+            const key = `${corp}_${rcpNo}`;
 
-            if (BAD_REGEX.test(title)) continue;
-            if (!GOOD_REGEX.test(title)) continue;
-
-            const key = `${corp}_${title}_${rcpNo}`;
             if (sentSet.has(key)) continue;
+            
+            // 1차 필터: 제목 검사
+            if (!GOOD_REGEX.test(title) || BAD_REGEX.test(title)) {
+                sentSet.add(key); 
+                continue;
+            }
+
+            // 2차 필터: 본문 추출
+            const docDetail = await getDartDetail(rcpNo);
+
+            let extraInfo = ""; // 추가 강조 문구용 변수
+
+            // [핵심 필터] 단일판매/공급계약일 경우 매출액 대비 20% 필터링
+            if (title.includes("단일판매") || title.includes("공급계약")) {
+                const match = docDetail.match(/매출액\s*대비\s*\(?\s*%\s*\)?\s*([\d.]+)/);
+                if (match) {
+                    const ratio = parseFloat(match[1]);
+                    
+                    // 20% 미만은 전송하지 않음
+                    if (ratio < 20) {
+                        console.log(`[필터] ${corp}: ${ratio}% (20% 미만 스킵)`);
+                        sentSet.add(key);
+                        continue; 
+                    }
+
+                    // 50% 이상은 특별 강조 문구 추가
+                    if (ratio >= 50) {
+                        extraInfo = `\n🔥 <b>[초강력 호재] 매출액 대비 무려 ${ratio}% 수주!</b>`;
+                    } else {
+                        extraInfo = `\n✅ <b>매출액 대비 ${ratio}%의 우량 계약입니다.</b>`;
+                    }
+                }
+            }
+            
+            // 제목이 모호한 경우 본문 정밀 검사
+            if (title.includes("투자판단") || title.includes("기타시장안내")) {
+                if (!DETAIL_HOT_KEYWORDS.test(docDetail)) {
+                    sentSet.add(key);
+                    continue;
+                }
+            }
+
             sentSet.add(key);
             if (sentSet.size > 1000) sentSet.delete(sentSet.values().next().value);
 
-            // [시간][종목명][내용] 로그 출력
-            console.log(`[${logTime}][${corp}][${title}]`);
+            console.log(`[${logTime}][발송] ${corp} (${title})`);
 
-            /* ===== 점수 시스템 (기존 유지) ===== */
-            let score = 0;
-            if (/임상\s*[23]상|CSR|결과\s*보고서/i.test(title)) score += 3;
-            if (/FDA\s*(승인|허가)|기술\s*이전|라이선스/i.test(title)) score += 3;
-            if (/(대규모|글로벌).*(계약|수주|공급)/i.test(title)) score += 3;
-            else if (/(계약|수주|공급)/i.test(title)) score += 2;
-            if (/무상\s*증자/i.test(title)) score += 4;
-            if (/로봇|탈모/i.test(title)) score += 1;
-
-            const tag = (score >= 6 || SPIKE_REGEX.test(title)) ? '🚀 <b>급등 가능성 HIGH</b>' : '⚠️ <b>단기 모멘텀</b>';
+            const hotTag = extractHotKeyword(title);
             const link = `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${rcpNo}`;
-
-            const docDetail = await getDartDetail(rcpNo, item.dcm_no);
-
-            // 메시지 구성 (약 300자 내외 가이드 포함)
             
-
             await bot.sendMessage(
                 targetChatId,
                 `🚨 <b>[DART 호재 감지]</b>\n\n` +
                 `🏢 <b>기업명:</b> ${corp}\n` +
-                `📄 <b>공시제목:</b> ${title}\n\n` +
+                `📄 <b>공시제목:</b> ${title}\n` +
+                `${extraInfo}\n\n` + // 여기에 강조 문구가 들어감
                 `📝 <b>내용 요약:</b>\n${docDetail}\n\n` +
-                `🏷️ <b>키워드:</b> ${hot}\n` +
-                `🔥 <b>점수:</b> <b>${score}</b>\n` +
-                `${tag}\n\n` +
+                `🏷️ <b>분류:</b> ${hotTag}\n` +
                 `🔗 <a href="${link}">공시 원문 바로가기</a>`,
-                { parse_mode: 'HTML', disable_web_page_preview: false }
+                { parse_mode: 'HTML', disable_web_page_preview: true }
             );
         }
     } catch (e) { console.error(`[${logTime}][에러] ${e.message}`); }
@@ -171,62 +191,99 @@ bot.onText(/\/off/, (msg) => {
 });
 
 
+
+
+
 /* ======================
-    🧪 즉시 테스트 명령어 (/test)
+    🧪 기존 로직 호출형 테스트 (/test100)
 ====================== */
-bot.onText(/\/test/, async (msg) => {
+bot.onText(/\/test100/, async (msg) => {
     const chatId = msg.chat.id;
-    targetChatId = chatId; // 테스트를 위해 현재 채팅방을 타겟으로 설정
+    targetChatId = chatId; // 현재 채팅방을 수신지로 설정
     
-    bot.sendMessage(chatId, "🔍 <b>DART 실시간 서버에서 최근 공시 3개를 가져와 테스트를 시작합니다...</b>", { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, "📊 <b>최근 공시 100건을 대상으로 필터링 시뮬레이션을 시작합니다...</b>", { parse_mode: 'HTML' });
 
     try {
-        // 최근 3개의 공시 리스트 호출
+        // 1. 최근 100건 리스트 가져오기
         const res = await axios.get(DART_LIST_URL, {
-            params: { crtfc_key: DART_API_KEY, page_count: 3 },
-            timeout: 5000
+            params: { crtfc_key: DART_API_KEY, page_count: 1000 },
+            timeout: 10000
         });
 
-        if (res.data.status !== '000') {
-            return bot.sendMessage(chatId, `❌ DART API 연결 실패: ${res.data.message}`);
-        }
+        if (res.data.status !== '000') return bot.sendMessage(chatId, "❌ API 연결 실패");
 
-        const list = res.data.list;
+        const list = res.data.list.reverse(); // 과거 -> 최신 순서로 정렬
+        let totalContracts = 0;
+        let passed = 0;
 
         for (const item of list) {
             const title = item.report_nm;
             const corp = item.corp_name;
             const rcpNo = item.rcept_no;
-            
-            // 1. 본문 추출 함수 호출
+
+            // [기존 필터 로직 그대로 적용]
+            if (!GOOD_REGEX.test(title) || BAD_REGEX.test(title)) continue;
+
+            // [기존 본문 추출 함수 호출]
             const docDetail = await getDartDetail(rcpNo);
             
-            // 2. 호재 여부와 상관없이 무조건 전송 (테스트 목적)
-            const hot = extractHotKeyword(title);
+            let extraInfo = "";
+
+            // 단일판매/공급계약인 경우 수치 필터링 로직 실행
+            if (title.includes("단일판매") || title.includes("공급계약")) {
+                totalContracts++;
+                const match = docDetail.match(/매출액\s*대비\s*\(?\s*%\s*\)?\s*([\d.]+)/);
+                
+                if (match) {
+                    const ratio = parseFloat(match[1]);
+                    
+                    // 20% 미만 스킵
+                    if (ratio < 10) {
+                        console.log(`[테스트-필터] ${corp}: ${ratio}% (기준미달)`);
+                        continue; 
+                    }
+
+                    // 20% 이상인 경우 통과
+                    passed++;
+                    if (ratio >= 50) {
+                        extraInfo = `\n🔥 <b>[초강력 호재] 매출액 대비 무려 ${ratio}% 수주!</b>`;
+                    } else {
+                        extraInfo = `\n✅ <b>매출액 대비 ${ratio}% 수주 확인</b>`;
+                    }
+                }
+            }
+
+            // [기존 메시지 전송 로직 호출 대신 여기서 직접 전송]
+            const hotTag = extractHotKeyword(title);
             const link = `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${rcpNo}`;
 
-            await bot.sendMessage(
-                chatId,
-                `🧪 <b>[테스트 전송]</b>\n\n` +
+            await bot.sendMessage(chatId, 
+                `🧪 <b>[시뮬레이션 통과]</b>\n\n` +
                 `🏢 <b>기업명:</b> ${corp}\n` +
-                `📄 <b>공시제목:</b> ${title}\n\n` +
+                `📄 <b>공시제목:</b> ${title}\n` +
+                `${extraInfo}\n\n` +
                 `📝 <b>내용 요약:</b>\n${docDetail}\n\n` +
-                `🏷️ <b>예상 키워드:</b> ${hot}\n` +
-                `🔗 <a href="${link}">공시 원문 바로가기</a>`,
+                `🏷️ <b>분류:</b> ${hotTag}\n` +
+                `🔗 <a href="${link}">원문보기</a>`,
                 { parse_mode: 'HTML', disable_web_page_preview: true }
             );
-            
-            // 연속 전송 시 메시지 순서 꼬임 방지 (1초 대기)
-            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // API 부하 방지 (매칭된 경우만 약간의 대기)
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
-        
-        bot.sendMessage(chatId, "✅ <b>3건의 테스트 전송이 완료되었습니다.</b>\n본문에 CSS 찌꺼기가 섞이지 않았는지 확인해 보세요.");
+
+        bot.sendMessage(chatId, 
+            `🏁 <b>시뮬레이션 완료!</b>\n\n` +
+            `📦 발견된 공급계약: ${totalContracts}건\n` +
+            `✅ 20% 이상 통과: ${passed}건\n` +
+            `📉 20% 미만 차단: ${totalContracts - passed}건`, 
+            { parse_mode: 'HTML' }
+        );
 
     } catch (e) {
-        bot.sendMessage(chatId, `❌ 테스트 중 오류 발생: ${e.message}`);
+        bot.sendMessage(chatId, "❌ 오류 발생: " + e.message);
     }
 });
-
 
 
 
@@ -277,7 +334,7 @@ async function getDartDetail(rcpNo) {
 
         text = finalLines.join('\n');
 
-        return text.substring(0, 500) + "...";
+        return text.substring(0, 300) + "...";
 
     } catch (e) {
         return "본문 추출 실패: " + e.message;
