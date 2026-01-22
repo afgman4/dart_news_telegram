@@ -2,6 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const moment = require('moment');
 const AdmZip = require('adm-zip');
+const zlib = require('zlib'); // 상단에 추가 필요
 
 /* ======================
     🔑 기본 설정
@@ -56,28 +57,50 @@ function isMarketOpen() {
 /* ======================
     🔍 본문 추출 및 [중요] 정제 로직
 ====================== */
+
+
 async function getDartDetail(rcpNo) {
     const apiUrl = `https://opendart.fss.or.kr/api/document.xml?crtfc_key=${DART_API_KEY}&rcept_no=${rcpNo}`;
+    
     try {
         const res = await axios.get(apiUrl, { responseType: 'arraybuffer', timeout: 10000 });
-        const zip = new AdmZip(res.data);
-        const zipEntries = zip.getEntries();
-        if (zipEntries.length === 0) return "본문 파일 없음";
+        const buffer = Buffer.from(res.data);
         
-        let content = zipEntries[0].getData().toString('utf8');
-        content = content.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
-        
-        // 정규식이 잘 작동하도록 모든 줄바꿈과 공백을 1칸으로 통일
-        let text = content.replace(/<[^>]*>?/g, " ")
-                         .replace(/&nbsp;/g, " ")
-                         .replace(/\s+/g, " ")
-                         .trim();
+        let content = "";
 
-        const startIdx = text.search(/[제목|성명|1\.|【]/);
-        if (startIdx !== -1) text = text.substring(startIdx);
+        // PK 시그니처 확인 (80, 75)
+        if (buffer[0] === 80 && buffer[1] === 75) {
+            try {
+                // 방법 A: AdmZip 시도
+                const zip = new AdmZip(buffer);
+                content = zip.getEntries()[0].getData().toString('utf8');
+            } catch (e) {
+                // 방법 B: AdmZip 실패 시 강제 문자열 변환 후 정제 (최후의 수단)
+                // 바이너리 데이터 사이의 한글/영문 텍스트만 추출
+                content = buffer.toString('utf8', 0, buffer.length);
+                console.log(` [주의] ${rcpNo} 압축 해제 실패, 강제 텍스트 변환 시도`);
+            }
+        } else {
+            content = buffer.toString('utf8');
+        }
 
-        return text.substring(0, 5000); 
-    } catch (e) { return "본문 추출 실패: " + e.message; }
+        // 공통 정제 로직 (HTML/XML 태그 제거)
+        let text = content
+            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "") 
+            .replace(/<[^>]*>?/g, " ")                     
+            .replace(/&nbsp;/g, " ")                       
+            .replace(/\s+/g, " ")                          
+            .trim();
+
+        // 만약 정제 후에도 이상한 바이너리 찌꺼기가 남았다면 한글/숫자/기호만 남김
+        text = text.replace(/[^가-힣ㄱ-ㅎㅏ-ㅣa-zA-Z0-9.\s%()\[\]:,-]/g, "");
+
+        return text || "본문 내용 없음";
+
+    } catch (e) {
+        console.error(` [추출 실패] ${rcpNo}: ${e.message}`);
+        return "본문 추출 실패";
+    }
 }
 
 /* ======================
@@ -144,7 +167,6 @@ async function scanDart(totalCount = 10, isTest = false, startDate = null, endDa
             let isPass = false;
             let extraInfo = "";
 
-            // --- 필터 로직 (수주/바이오/투자) ---
             // [수정된 로직 1] 수주/공급계약 비율 추출 정밀화
             if (title.includes("단일판매") || title.includes("공급계약")) {
                 // 1. "매출액대비(%)" 바로 뒤에 오는 숫자(소수점 포함)를 정확히 타겟팅
@@ -154,12 +176,15 @@ async function scanDart(totalCount = 10, isTest = false, startDate = null, endDa
                     const ratio = parseFloat(ratioMatch[1]);
                     
                     // 2. 만약 추출된 숫자가 비정상적으로 크거나(예: 지분율 80), 
-                    // 제목에 '기재정정'이 없는데 20% 이상인 경우만 통과
-                    if (ratio >= 30 && ratio < 1000) { // 보통 매출 대비 1000% 넘는 경우는 극히 드묾
+                    // 30% 이상인 경우만 통과 (1000% 미만 조건 포함)
+                    if (ratio >= 30 && ratio < 1000) { 
                         isPass = true;
-                        extraInfo = ratio >= 50 ? `\n🔥 <b>[초강력 수주] 매출액 대비 ${ratio}%!</b>` : `\n✅ <b>우량 수주: 매출액 대비 ${ratio}%</b>`;
+                        extraInfo = ratio >= 60 
+                            ? `\n🔴🔴🔴 <b>[초강력 수주] 매출액 대비 ${ratio}%!</b>` 
+                            : `\n🔴 <b>우량 수주: 매출액 대비 ${ratio}%</b>`;
                     }
                 } else if (title.includes("기재정정")) {
+                    // 비율을 못 찾더라도 기재정정 공시는 중요하므로 통과
                     isPass = true;
                     extraInfo = `\n🔄 <b>수주 내용 정정 공시 (기존 계약)</b>`;
                 }
@@ -174,7 +199,7 @@ async function scanDart(totalCount = 10, isTest = false, startDate = null, endDa
                 const match = docDetail.match(playerRegex);
                 let mainPlayer = match ? match[1].trim() : "본문 참조";
                 mainPlayer = mainPlayer.split("회사와의")[0].split("(")[0].trim();
-                extraInfo = SUPER_INVESTORS.test(mainPlayer) ? `\n💎 <b>[특급 투자자: ${mainPlayer}]</b>` : `\n🤝 <b>[투자 유치: ${mainPlayer}]</b>`;
+                extraInfo = SUPER_INVESTORS.test(mainPlayer) ? `\n💎 <b>[🔴🔴🔴특급 투자자: ${mainPlayer}]</b>` : `\n🤝 <b>[투자 유치: ${mainPlayer}]</b>`;
             }
 
             if (!isPass) {
@@ -212,13 +237,26 @@ bot.onText(/\/off/, (msg) => {
     bot.sendMessage(msg.chat.id, "🛑 <b>모니터링 중지</b>");
 });
 
-bot.onText(/\/test100/, (msg) => {
+bot.onText(/\/test100/, async (msg) => {
     targetChatId = msg.chat.id;
+    
+    // 1. 기간 설정: 오늘 하루가 아니라 최근 3일 정도로 넓혀야 1000건을 채울 수 있습니다.
     const end = moment().format('YYYYMMDD');
-    const bgn = moment().subtract(2, 'days').format('YYYYMMDD');
-    bot.sendMessage(targetChatId, `📊 <b>시뮬레이션 시작 (${bgn}~${end})</b>`);
-    scanDart(1000, true, bgn, end);
+    const bgn = moment().subtract(3, 'days').format('YYYYMMDD'); 
+
+    await bot.sendMessage(targetChatId, `📊 <b>대규모 시뮬레이션 시작</b>\n📅 기간: ${bgn} ~ ${end}\n🔍 대상: 최신 공시 1,000건`, { parse_mode: 'HTML' });
+
+    try {
+        // 2. 반드시 await를 붙여서 스캔이 끝날 때까지 기다려야 합니다.
+        await scanDart(1000, true, bgn, end); 
+        
+        await bot.sendMessage(targetChatId, `✅ <b>시뮬레이션 완료!</b>\n필터링된 호재 공시를 확인하세요.`, { parse_mode: 'HTML' });
+    } catch (e) {
+        console.error(e);
+        await bot.sendMessage(targetChatId, `❌ 시뮬레이션 중 에러 발생`);
+    }
 });
+
 
 /* ======================
     🧪 큐라클 임상 결과 정밀 분석 테스트 (/test_curacle)
